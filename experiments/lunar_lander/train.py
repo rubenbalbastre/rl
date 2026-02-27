@@ -1,6 +1,7 @@
 import torch
 import gymnasium as gym
 import matplotlib.pyplot as plt
+import os
 
 
 # 1. Environment setup
@@ -77,9 +78,18 @@ def compute_gae(rewards, values, dones, next_value, gamma=0.99, lam=0.95):
 
 # 4. Training loop
 
-num_updates = 10
-batch_size = 64
+num_updates = 100
+batch_size = 256
 ppo_epochs = 4
+clip_epsilon = 0.2
+
+# Metrics
+episode_returns = []
+policy_losses = []
+value_losses = []
+entropies = []
+approx_kls = []
+clip_fractions = []
 
 for update in range(num_updates):
 
@@ -89,6 +99,7 @@ for update in range(num_updates):
     rewards_rollout = []
     values_rollout = []
     action_rollout = []
+    dones_rollout = []
 
     with torch.no_grad():
         for _ in range(batch_size):
@@ -100,32 +111,45 @@ for update in range(num_updates):
 
             action_dist = torch.distributions.Normal(mu, std)
             action = action_dist.sample()
-            action = torch.clamp(action, torch.tensor(env.action_space.low), torch.tensor(env.action_space.high))  # Ensure actions are within bounds
-
             log_prob = action_dist.log_prob(action).sum(-1)  # Sum log probs for multi-dimensional actions
+            action_clipped = torch.clamp(
+                action,
+                torch.tensor(env.action_space.low),
+                torch.tensor(env.action_space.high),
+            )
 
             # 2. get value estimates for the current observations
             value = value_model(obs_tensor)
             values_rollout.append(value)
 
             # 3. get next observations and rewards from the environment
-            observations, reward, done, truncated, info = env.step(action.numpy())
+            observations, reward, done, truncated, info = env.step(action_clipped.numpy())
             
             # 4. logging
             observations_rollout.append(obs_tensor)
             log_probs_rollout.append(log_prob)
             rewards_rollout.append(reward)
             action_rollout.append(action)
+            dones_rollout.append(done or truncated)
 
             if done or truncated:
                 observations, info = env.reset()
 
     # Compute advantages
-    advantages, returns = compute_gae(rewards_rollout, values=torch.stack(values_rollout), dones=[0]*len(rewards_rollout), next_value=0, gamma=gamma)
+    advantages, returns = compute_gae(
+        rewards_rollout,
+        values=torch.stack(values_rollout),
+        dones=dones_rollout,
+        next_value=0,
+        gamma=gamma,
+    )
     advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
     old_log_probs = torch.stack(log_probs_rollout)
     action_rollout = torch.stack(action_rollout)
     observations_rollout = torch.stack(observations_rollout)
+
+    # Log episode return for this rollout
+    episode_returns.append(sum(rewards_rollout))
 
     for epoch in range(ppo_epochs):
 
@@ -139,10 +163,21 @@ for update in range(num_updates):
         values = value_model(observations_rollout)
 
         # Loss computation
-        policy_loss = compute_clipped_ppo_policy_loss(old_log_probs, new_log_probs, advantages)
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        clipped_ratio = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon)
+        policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
         value_loss = 0.5 * (returns - values.squeeze(-1)).pow(2).mean()
         entropy_bonus = action_dist.entropy().mean()
         loss = compute_ppo_loss(policy_loss, value_loss, entropy_bonus, value_loss_coef=0.5, entropy_coef=0.01)
+
+        # Metrics
+        approx_kl = (old_log_probs - new_log_probs).mean()
+        clip_frac = ((ratio > (1 + clip_epsilon)) | (ratio < (1 - clip_epsilon))).float().mean()
+        policy_losses.append(policy_loss.item())
+        value_losses.append(value_loss.item())
+        entropies.append(entropy_bonus.item())
+        approx_kls.append(approx_kl.item())
+        clip_fractions.append(clip_frac.item())
 
         # Update policy
         optimizer.zero_grad()
@@ -150,4 +185,58 @@ for update in range(num_updates):
         torch.nn.utils.clip_grad_norm_(list(policy_model.parameters()) + list(value_model.parameters()), max_norm=0.5)  # Gradient clipping
         optimizer.step()
 
-        print(f"Update {update+1}/{num_updates}, Epoch {epoch+1}/{ppo_epochs}, Loss: {loss.item():.4f}, Policy Loss: {policy_loss.item():.4f}, Value Loss: {value_loss.item():.4f}, Entropy Bonus: {entropy_bonus.item():.4f}")
+        # print(f"Update {update+1}/{num_updates}, Epoch {epoch+1}/{ppo_epochs}, Loss: {loss.item():.4f}, Policy Loss: {policy_loss.item():.4f}, Value Loss: {value_loss.item():.4f}, Entropy Bonus: {entropy_bonus.item():.4f}")
+
+# 5. Plotting results
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=120)
+
+# Episode return
+ax = axes[0, 0]
+ax.plot(episode_returns, label="Episode return")
+if len(episode_returns) >= 10:
+    window = min(50, len(episode_returns))
+    rolling = torch.tensor(episode_returns).float().unfold(0, window, 1).mean(dim=1).numpy()
+    ax.plot(range(window - 1, len(episode_returns)), rolling, label=f"{window}-ep mean")
+ax.set_title("Episode Return")
+ax.set_xlabel("Updates")
+ax.set_ylabel("Return")
+ax.legend(frameon=False)
+ax.grid(True)
+
+# Policy & value loss
+ax = axes[0, 1]
+ax.plot(policy_losses, label="Policy loss")
+ax.plot(value_losses, label="Value loss")
+ax.set_title("Losses")
+ax.set_xlabel("Epochs")
+ax.set_ylabel("Loss")
+ax.legend(frameon=False)
+ax.grid(True)
+
+# Entropy
+ax = axes[1, 0]
+ax.plot(entropies, label="Entropy")
+ax.set_title("Entropy")
+ax.set_xlabel("Epochs")
+ax.set_ylabel("Entropy")
+ax.legend(frameon=False)
+ax.grid(True)
+
+# Approx KL / Clip fraction
+ax = axes[1, 1]
+ax.plot(approx_kls, label="Approx KL")
+ax.plot(clip_fractions, label="Clip fraction")
+ax.set_title("KL / Clip Fraction")
+ax.set_xlabel("Epochs")
+ax.set_ylabel("Value")
+ax.legend(frameon=False)
+ax.grid(True)
+
+fig.tight_layout()
+plt.show()
+
+
+figures_dir = "experiments/lunar_lander/figures/"
+os.makedirs(figures_dir, exist_ok=True)
+fig.savefig(f"{figures_dir}lunar_lander_training.png")
