@@ -32,7 +32,7 @@ gamma = 0.99
 # 3. Environment setup
 
 env = gym.make("CartPole-v1")
-observations, info = env.reset()
+observations, info = env.reset(seed=0)
 
 # 4. Training loop
 
@@ -51,7 +51,7 @@ completed_rewards = []
 
 for episode in range(num_episodes):
 
-    observation, _ = env.reset()
+    observation, _ = env.reset(seed=episode)
     log_probs_episode = []
     rewards_episode = []
     done = False
@@ -59,13 +59,13 @@ for episode in range(num_episodes):
     while not done:
 
         # get action from policy
-        torch_observations = torch.tensor(observations, dtype=torch.float32)
-        logits = policy_model(torch_observations)
+        torch_observation = torch.tensor(observation, dtype=torch.float32)
+        logits = policy_model(torch_observation)
         dist = torch.distributions.Categorical(logits=logits)
         actions = dist.sample()
 
         # get observation from environment
-        observations, rewards, terminated, truncated, info = env.step(actions.numpy())
+        observation, rewards, terminated, truncated, info = env.step(actions.numpy())
         done = terminated or truncated
 
         # store log probs and rewards
@@ -74,10 +74,10 @@ for episode in range(num_episodes):
     
     # compute returns and advantages
     returns = discounted_returns(rewards_episode, gamma=gamma)
-    advantages = (returns - returns.mean()) / (returns.std(unbiased=False) + 1e-8)
+    returns = (returns - returns.mean()) / (returns.std(unbiased=False) + 1e-8)
 
     # loss
-    loss = -(torch.stack(log_probs_episode) * advantages).sum()
+    loss = -(torch.stack(log_probs_episode) * returns).sum()
     losses.append(loss.item())
 
     # update policy
