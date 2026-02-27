@@ -32,3 +32,6 @@ python train.py
 
 ## Output
 The script saves a plot to `experiments/cartpole/figures/cartpole_training.png`.
+
+## Result
+![CartPole training curves](figures/cartpole_training.png)
