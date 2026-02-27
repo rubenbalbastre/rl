@@ -41,18 +41,14 @@ def policy_gradient_loss(logits: torch.Tensor,
     loss = -(chosen_log_probs * advantages).mean()
     return loss
 
-num_steps = 10000
+num_episodes = 400
 optimizer = torch.optim.Adam(policy_model.parameters(), lr=1e-3)
-batch_size = 8
 gamma = 0.99
 
 # 3. Environment setup
 
-envs = gym.vector.SyncVectorEnv(
-    [lambda: gym.make("CartPole-v1") for _ in range(batch_size)],
-    autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP
-)
-observations, info = envs.reset()
+env = gym.make("CartPole-v1")
+observations, info = env.reset()
 
 def discounted_returns(rewards, gamma):
     returns = []
@@ -64,103 +60,69 @@ def discounted_returns(rewards, gamma):
     return torch.tensor(returns, dtype=torch.float32)
 
 
-# logging variables
-losses = []
-loss_steps = []
-episode_observations = [[] for _ in range(batch_size)]
-episode_actions = [[] for _ in range(batch_size)]
-episode_rewards = [[] for _ in range(batch_size)]
-completed_rewards = []
-completed_steps = []
-total_env_steps = 0
-
 # 4. Training loop
+losses = []
+completed_rewards = []
 
-for epoch_id in range(num_steps):
+for episode in range(num_episodes):
 
-    # get action from policy
-    torch_observations = torch.tensor(observations, dtype=torch.float32)
-    logits = policy_model(torch_observations)
-    dist = torch.distributions.Categorical(logits=logits)
-    actions = dist.sample()
+    observation, _ = env.reset()
+    log_probs_episode = []
+    rewards_episode = []
+    done = False
 
-    # get observation from environment
-    observations, rewards, terminated, truncated, info = envs.step(actions.numpy())
+    while not done:
+
+        # get action from policy
+        torch_observations = torch.tensor(observations, dtype=torch.float32)
+        logits = policy_model(torch_observations)
+        dist = torch.distributions.Categorical(logits=logits)
+        actions = dist.sample()
+
+        # get observation from environment
+        observations, rewards, terminated, truncated, info = env.step(actions.numpy())
+        done = terminated or truncated
+
+        # store log probs and rewards
+        log_probs_episode.append(dist.log_prob(actions))
+        rewards_episode.append(rewards)
+    
+    # compute returns and advantages
+    returns = discounted_returns(rewards_episode, gamma=gamma)
+    advantages = (returns - returns.mean()) / (returns.std(unbiased=False) + 1e-8)
+
+    # loss
+    loss = -(torch.stack(log_probs_episode) * advantages).sum()
+    losses.append(loss.item())
+
+    # update policy
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
 
     # logging
-    total_env_steps += batch_size
-    for i in range(batch_size):
-        episode_observations[i].append(observations[i])
-        episode_actions[i].append(actions[i].item())
-        episode_rewards[i].append(rewards[i])
+    completed_rewards.append(sum(rewards_episode))
 
-    # update only for completed episodes
-    done = terminated | truncated
-    if done.any():
-
-        # zero gradients
-        optimizer.zero_grad()
-
-        # compute loss for completed episodes and update policy
-        done_indices = np.where(done)[0].tolist()
-        per_episode_losses = []
-        for i in done_indices:
-
-            obs_tensor = torch.tensor(
-                np.array(episode_observations[i], dtype=np.float32),
-                dtype=torch.float32,
-            )
-            act_tensor = torch.tensor(episode_actions[i], dtype=torch.int64)
-            
-            # compute policy
-            logits_ep = policy_model(obs_tensor)
-            log_probs_ep = F.log_softmax(logits_ep, dim=-1)
-
-            # compute discounted returns and advantages
-            returns = discounted_returns(episode_rewards[i], gamma=gamma)
-            advantages = (returns - returns.mean()) / (returns.std(unbiased=False) + 1e-8)
-            
-            # compute loss for the episode
-            loss = policy_gradient_loss(logits_ep, act_tensor, advantages)
-            per_episode_losses.append(loss)
-
-            # log episode return and reset episode data
-            completed_rewards.append(float(sum(episode_rewards[i])))
-            completed_steps.append(total_env_steps)
-            episode_observations[i] = []
-            episode_actions[i] = []
-            episode_rewards[i] = []
-
-        # compute mean loss across completed episodes and update policy
-        loss = torch.stack(per_episode_losses).mean()
-        loss.backward()
-        optimizer.step()
-
-        losses.append(loss.item())
-        loss_steps.append(total_env_steps)
-
-envs.close()
+env.close()
 
 # 5. Plotting results
 
 fig = plt.figure(figsize=(12, 5))
 plt.subplot(1, 2, 1)
-if losses:
-    plt.plot(loss_steps, losses, "o-")
+plt.plot(losses, "o-")
 plt.title("Policy Loss")
-plt.xlabel("Environment Steps")
+plt.xlabel("Environments")
 plt.ylabel("Loss")
 
 plt.subplot(1, 2, 2)
-if completed_rewards:
-    plt.plot(completed_steps, completed_rewards, "o-", label="Episode return")
-    window = min(20, len(completed_rewards))
-    if window >= 2:
-        rolling = np.convolve(completed_rewards, np.ones(window) / window, mode="valid")
-        rolling_steps = completed_steps[window - 1:]
-        plt.plot(rolling_steps, rolling, "-", label=f"{window}-ep mean")
+plt.plot(completed_rewards, "o-", label="Episode return")
+window = min(20, len(completed_rewards))
+if window >= 2:
+    rolling = np.convolve(completed_rewards, np.ones(window) / window, mode="valid")
+    rolling_steps = list(range(window - 1, len(completed_rewards)))
+    plt.plot(rolling_steps, rolling, "-", label=f"{window}-ep mean")
 plt.title("Episode Returns")
-plt.xlabel("Environment Steps")
+plt.xlabel("Environments")
 plt.ylabel("Return")
 plt.legend()
 plt.tight_layout()
