@@ -1,6 +1,5 @@
 import gymnasium as gym
 import torch
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import os
 import numpy as np
@@ -27,20 +26,6 @@ policy_model = Policy(input_dim=4, output_dim=2)
 
 # 2. Training Algorithm
 
-def policy_gradient_loss(logits: torch.Tensor,
-                         actions: torch.Tensor,
-                         advantages: torch.Tensor
-                         ) -> torch.Tensor:
-    """
-    logits: [batch, num_actions]
-    actions: [batch] (int64)
-    advantages: [batch] (float)
-    """
-    log_probs = F.log_softmax(logits, dim=-1)
-    chosen_log_probs = log_probs.gather(1, actions.long().unsqueeze(1)).squeeze(1)
-    loss = -(chosen_log_probs * advantages).mean()
-    return loss
-
 num_episodes = 400
 optimizer = torch.optim.Adam(policy_model.parameters(), lr=1e-3)
 gamma = 0.99
@@ -49,6 +34,8 @@ gamma = 0.99
 
 env = gym.make("CartPole-v1")
 observations, info = env.reset()
+
+# 4. Training loop
 
 def discounted_returns(rewards, gamma):
     returns = []
@@ -60,7 +47,6 @@ def discounted_returns(rewards, gamma):
     return torch.tensor(returns, dtype=torch.float32)
 
 
-# 4. Training loop
 losses = []
 completed_rewards = []
 
