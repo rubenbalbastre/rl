@@ -1,6 +1,7 @@
 import torch
 import gymnasium as gym
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 import os
 
 
@@ -47,7 +48,10 @@ value_model = ValueFunction(input_dim=observation_dim_space)
 
 # 3. Training Algorithm
 
-optimizer = torch.optim.Adam(list(policy_model.parameters()) + list(value_model.parameters()), lr=1e-3)
+optimizer = torch.optim.Adam(
+    list(policy_model.parameters()) + list(value_model.parameters()), 
+    lr=1e-3
+)
 gamma = 0.99
 
 
@@ -78,20 +82,21 @@ def compute_gae(rewards, values, dones, next_value, gamma=0.99, lam=0.95):
 
 # 4. Training loop
 
-num_updates = 100
-batch_size = 256
-ppo_epochs = 4
+num_updates = 3000
+batch_size = 512
+ppo_epochs = 8
 clip_epsilon = 0.2
 
 # Metrics
 episode_returns = []
+episode_return = 0.0
 policy_losses = []
 value_losses = []
 entropies = []
 approx_kls = []
 clip_fractions = []
 
-for update in range(num_updates):
+for update in tqdm(range(num_updates), desc="Training PPO"):
 
     # Collect trajectories
     observations_rollout = []
@@ -131,25 +136,31 @@ for update in range(num_updates):
             rewards_rollout.append(reward)
             action_rollout.append(action)
             dones_rollout.append(done or truncated)
+            episode_return += reward
 
             if done or truncated:
+                episode_returns.append(episode_return)
+                episode_return = 0.0
                 observations, info = env.reset()
 
     # Compute advantages
+    with torch.no_grad():
+        if len(dones_rollout) > 0 and not dones_rollout[-1]:
+            next_value = value_model(torch.tensor(observations, dtype=torch.float32)).item()
+        else:
+            next_value = 0.0
+
     advantages, returns = compute_gae(
         rewards_rollout,
         values=torch.stack(values_rollout),
         dones=dones_rollout,
-        next_value=0,
+        next_value=next_value,
         gamma=gamma,
     )
     advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
     old_log_probs = torch.stack(log_probs_rollout)
     action_rollout = torch.stack(action_rollout)
     observations_rollout = torch.stack(observations_rollout)
-
-    # Log episode return for this rollout
-    episode_returns.append(sum(rewards_rollout))
 
     for epoch in range(ppo_epochs):
 
@@ -168,7 +179,7 @@ for update in range(num_updates):
         policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
         value_loss = 0.5 * (returns - values.squeeze(-1)).pow(2).mean()
         entropy_bonus = action_dist.entropy().mean()
-        loss = compute_ppo_loss(policy_loss, value_loss, entropy_bonus, value_loss_coef=0.5, entropy_coef=0.01)
+        loss = compute_ppo_loss(policy_loss, value_loss, entropy_bonus, value_loss_coef=0.5, entropy_coef=0.0001)
 
         # Metrics
         approx_kl = (old_log_probs - new_log_probs).mean()
@@ -185,57 +196,100 @@ for update in range(num_updates):
         torch.nn.utils.clip_grad_norm_(list(policy_model.parameters()) + list(value_model.parameters()), max_norm=0.5)  # Gradient clipping
         optimizer.step()
 
-        # print(f"Update {update+1}/{num_updates}, Epoch {epoch+1}/{ppo_epochs}, Loss: {loss.item():.4f}, Policy Loss: {policy_loss.item():.4f}, Value Loss: {value_loss.item():.4f}, Entropy Bonus: {entropy_bonus.item():.4f}")
+    # Early stopping if solved
+    if len(episode_returns) >= 100:
+        avg100 = sum(episode_returns[-100:]) / 100
+        if avg100 >= 200:
+            print(f"Solved at update {update + 1}, avg100={avg100:.1f}")
+            break
 
 # 5. Plotting results
 
-fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=120)
+fig, axes = plt.subplots(3, 2, figsize=(12, 8), dpi=120)
+
+def moving_average(values, window):
+    if len(values) < window:
+        return []
+    return (
+        torch.tensor(values, dtype=torch.float32)
+        .unfold(0, window, 1)
+        .mean(dim=1)
+        .numpy()
+    )
 
 # Episode return
 ax = axes[0, 0]
-ax.plot(episode_returns, label="Episode return")
+ax.plot(episode_returns, color="#1f77b4", alpha=0.35, label="Episode return")
 if len(episode_returns) >= 10:
     window = min(50, len(episode_returns))
-    rolling = torch.tensor(episode_returns).float().unfold(0, window, 1).mean(dim=1).numpy()
-    ax.plot(range(window - 1, len(episode_returns)), rolling, label=f"{window}-ep mean")
+    rolling = moving_average(episode_returns, window)
+    ax.plot(range(window - 1, len(episode_returns)), rolling, color="#1f77b4", label=f"{window}-ep mean")
 ax.set_title("Episode Return")
 ax.set_xlabel("Updates")
 ax.set_ylabel("Return")
 ax.legend(frameon=False)
 ax.grid(True)
 
-# Policy & value loss
+# Policy
 ax = axes[0, 1]
-ax.plot(policy_losses, label="Policy loss")
-ax.plot(value_losses, label="Value loss")
-ax.set_title("Losses")
+ax.set_title("Policy loss")
 ax.set_xlabel("Epochs")
-ax.set_ylabel("Loss")
-ax.legend(frameon=False)
+ax.set_ylabel("Policy loss")
+line1 = ax.plot(policy_losses, color="#1f77b4", alpha=0.35, label="Policy loss")
 ax.grid(True)
+if len(policy_losses) >= 10:
+    window = min(50, len(policy_losses))
+    rolling = moving_average(policy_losses, window)
+    ax.plot(range(window - 1, len(policy_losses)), rolling, color="#1f77b4", label=f"{window}-ep mean")
+
+# Value loss
+ax2 = axes[1, 1]
+ax2.set_ylabel("Value loss")
+ax2.set_title("Value loss")
+ax2.set_xlabel("Epochs")
+line2 = ax2.plot(value_losses, color="#ff7f0e", alpha=0.35, label="Value loss")
+ax2.grid(True)
+if len(value_losses) >= 10:
+    window = min(50, len(value_losses))
+    rolling = moving_average(value_losses, window)
+    ax2.plot(range(window - 1, len(value_losses)), rolling, color="#ff7f0e", label=f"{window}-ep mean")
 
 # Entropy
 ax = axes[1, 0]
-ax.plot(entropies, label="Entropy")
+ax.plot(entropies, color="#2ca02c", alpha=0.35, label="Entropy")
 ax.set_title("Entropy")
 ax.set_xlabel("Epochs")
 ax.set_ylabel("Entropy")
-ax.legend(frameon=False)
 ax.grid(True)
+if len(entropies) >= 10:
+    window = min(50, len(entropies))
+    rolling = moving_average(entropies, window)
+    ax.plot(range(window - 1, len(entropies)), rolling, color="#2ca02c", label=f"{window}-ep mean")
 
-# Approx KL / Clip fraction
-ax = axes[1, 1]
-ax.plot(approx_kls, label="Approx KL")
-ax.plot(clip_fractions, label="Clip fraction")
-ax.set_title("KL / Clip Fraction")
+# Approx KL / Clip fraction (separate y-axes)
+ax = axes[2, 1]
+ax.set_title("Approx KL")
 ax.set_xlabel("Epochs")
-ax.set_ylabel("Value")
-ax.legend(frameon=False)
+ax.set_ylabel("Approx KL")
+ax.plot(approx_kls, color="#1f77b4", alpha=0.35, label="Approx KL")
 ax.grid(True)
+if len(approx_kls) >= 10:
+    window = min(50, len(approx_kls))
+    rolling = moving_average(approx_kls, window)
+    ax.plot(range(window - 1, len(approx_kls)), rolling, color="#1f77b4", label=f"{window}-ep mean")
+
+ax = axes[2, 0]
+ax.set_title("Clip fraction")
+ax.set_xlabel("Epochs")
+ax.set_ylabel("Clip fraction")
+ax.plot(clip_fractions, color="#ff7f0e", alpha=0.35, label="Clip fraction")
+ax.grid(True)
+if len(clip_fractions) >= 10:
+    window = min(50, len(clip_fractions))
+    rolling = moving_average(clip_fractions, window)
+    ax.plot(range(window - 1, len(clip_fractions)), rolling, color="#ff7f0e", label=f"{window}-ep mean")
 
 fig.tight_layout()
-plt.show()
-
 
 figures_dir = "experiments/lunar_lander/figures/"
 os.makedirs(figures_dir, exist_ok=True)
