@@ -13,43 +13,35 @@ observations, info = env.reset()
 
 # 2. Define a simple policy network for the LunarLander environment
 
-class Policy(torch.nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(Policy, self).__init__()
-        self.fc1 = torch.nn.Linear(input_dim, 64)
-        self.fc2 = torch.nn.Linear(64, output_dim)
+class PolicyValueModel(torch.nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=64):
+        super(PolicyValueModel, self).__init__()
+        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
+
+        self.policy_head = torch.nn.Linear(hidden_dim, output_dim)  # For mean of action distribution
 
         self.log_std = torch.nn.Parameter(torch.zeros(output_dim))  # Learnable log standard deviation for continuous actions
 
+        self.value_head = torch.nn.Linear(hidden_dim, 1)  # For value estimation
+
     def forward(self, x):
         x = torch.relu(self.fc1(x))
-        mu = self.fc2(x)
-        return mu, self.log_std
+        mu = self.policy_head(x)
+        value = self.value_head(x)
+        return mu, self.log_std, value
     
-
-class ValueFunction(torch.nn.Module):
-    def __init__(self, input_dim):
-        super(ValueFunction, self).__init__()
-        self.fc1 = torch.nn.Linear(input_dim, 64)
-        self.fc2 = torch.nn.Linear(64, 1)
-
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        value = self.fc2(x)
-        return value.squeeze(-1)  # Return a scalar value
-
 
 action_dim_space = env.action_space.shape[0]
 observation_dim_space = env.observation_space.shape[0]
 print(f"Action space dimension: {action_dim_space}, Observation space dimension: {observation_dim_space}")
-policy_model = Policy(input_dim=observation_dim_space, output_dim=action_dim_space)
-value_model = ValueFunction(input_dim=observation_dim_space)
+policy_value_model = PolicyValueModel(input_dim=observation_dim_space, output_dim=action_dim_space)
 
 
 # 3. Training Algorithm
 
 optimizer = torch.optim.Adam(
-    list(policy_model.parameters()) + list(value_model.parameters()), 
+    list(policy_value_model.parameters()), 
     lr=1e-3
 )
 gamma = 0.99
@@ -111,7 +103,7 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
 
             # 1. get actions from the policy
             obs_tensor = torch.tensor(observations, dtype=torch.float32)
-            mu, log_std = policy_model(obs_tensor)
+            mu, log_std, _ = policy_value_model(obs_tensor)
             std = torch.exp(log_std)
 
             action_dist = torch.distributions.Normal(mu, std)
@@ -124,7 +116,7 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
             )
 
             # 2. get value estimates for the current observations
-            value = value_model(obs_tensor)
+            _, _, value = policy_value_model(obs_tensor)
             values_rollout.append(value)
 
             # 3. get next observations and rewards from the environment
@@ -146,7 +138,8 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
     # Compute advantages
     with torch.no_grad():
         if len(dones_rollout) > 0 and not dones_rollout[-1]:
-            next_value = value_model(torch.tensor(observations, dtype=torch.float32)).item()
+            _, _, next_value = policy_value_model(torch.tensor(observations, dtype=torch.float32))
+            next_value = next_value.item()
         else:
             next_value = 0.0
 
@@ -165,13 +158,13 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
     for epoch in range(ppo_epochs):
 
         # get policy outputs for the current batch of observations
-        logits, log_std = policy_model(observations_rollout)
+        logits, log_std, _ = policy_value_model(observations_rollout)
         std = torch.exp(log_std)
         action_dist = torch.distributions.Normal(logits, std)
         new_log_probs = action_dist.log_prob(action_rollout).sum(-1)  # Sum log probs for multi-dimensional actions
 
         # get values for the current batch of observations
-        values = value_model(observations_rollout)
+        _, _, values = policy_value_model(observations_rollout)
 
         # Loss computation
         ratio = torch.exp(new_log_probs - old_log_probs)
@@ -179,7 +172,13 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
         policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
         value_loss = 0.5 * (returns - values.squeeze(-1)).pow(2).mean()
         entropy_bonus = action_dist.entropy().mean()
-        loss = compute_ppo_loss(policy_loss, value_loss, entropy_bonus, value_loss_coef=0.5, entropy_coef=0.0001)
+        loss = compute_ppo_loss(
+            policy_loss, 
+            value_loss, 
+            entropy_bonus, 
+            value_loss_coef=0.5, 
+            entropy_coef=0.0001
+        )
 
         # Metrics
         approx_kl = (old_log_probs - new_log_probs).mean()
@@ -193,7 +192,7 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
         # Update policy
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(policy_model.parameters()) + list(value_model.parameters()), max_norm=0.5)  # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(list(policy_value_model.parameters()), max_norm=0.5)  # Gradient clipping
         optimizer.step()
 
     # Early stopping if solved
