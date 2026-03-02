@@ -5,10 +5,43 @@ from tqdm import tqdm
 import os
 
 
+
+# Running mean/std for observation normalization
+class RunningMeanStd:
+    def __init__(self, shape, eps=1e-8):
+        self.mean = torch.zeros(shape, dtype=torch.float32)
+        self.var = torch.ones(shape, dtype=torch.float32)
+        self.count = eps
+
+    def update(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32)
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)
+        batch_count = x.shape[0]
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32)
+        return (x - self.mean) / (torch.sqrt(self.var) + 1e-8)
+
+
 # 1. Environment setup
 
 env = gym.make("LunarLander-v3", continuous=True, enable_wind=False)
 observations, info = env.reset()
+obs_rms = RunningMeanStd(shape=observations.shape)
 
 
 # 2. Define a simple policy network for the LunarLander environment
@@ -74,7 +107,7 @@ def compute_gae(rewards, values, dones, next_value, gamma=0.99, lam=0.95):
 
 # 4. Training loop
 
-num_updates = 3000
+num_updates = 300
 batch_size = 512
 ppo_epochs = 8
 clip_epsilon = 0.2
@@ -101,9 +134,10 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
     with torch.no_grad():
         for _ in range(batch_size):
 
-            # 1. get actions from the policy
-            obs_tensor = torch.tensor(observations, dtype=torch.float32)
-            mu, log_std, _ = policy_value_model(obs_tensor)
+            # 1. get actions from the policy and value estimates for the current observations
+            obs_rms.update(observations[None, :])
+            obs_tensor = obs_rms.normalize(observations)
+            mu, log_std, value = policy_value_model(obs_tensor)
             std = torch.exp(log_std)
 
             action_dist = torch.distributions.Normal(mu, std)
@@ -114,9 +148,6 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
                 torch.tensor(env.action_space.low),
                 torch.tensor(env.action_space.high),
             )
-
-            # 2. get value estimates for the current observations
-            _, _, value = policy_value_model(obs_tensor)
             values_rollout.append(value)
 
             # 3. get next observations and rewards from the environment
@@ -138,7 +169,8 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
     # Compute advantages
     with torch.no_grad():
         if len(dones_rollout) > 0 and not dones_rollout[-1]:
-            _, _, next_value = policy_value_model(torch.tensor(observations, dtype=torch.float32))
+            next_obs_tensor = obs_rms.normalize(observations)
+            _, _, next_value = policy_value_model(next_obs_tensor)
             next_value = next_value.item()
         else:
             next_value = 0.0
@@ -157,14 +189,11 @@ for update in tqdm(range(num_updates), desc="Training PPO"):
 
     for epoch in range(ppo_epochs):
 
-        # get policy outputs for the current batch of observations
-        logits, log_std, _ = policy_value_model(observations_rollout)
+        # get policy outputs and values for the current batch of observations
+        logits, log_std, values = policy_value_model(observations_rollout)
         std = torch.exp(log_std)
         action_dist = torch.distributions.Normal(logits, std)
         new_log_probs = action_dist.log_prob(action_rollout).sum(-1)  # Sum log probs for multi-dimensional actions
-
-        # get values for the current batch of observations
-        _, _, values = policy_value_model(observations_rollout)
 
         # Loss computation
         ratio = torch.exp(new_log_probs - old_log_probs)
