@@ -17,6 +17,9 @@ This experiment uses Proximal Policy Optimization (PPO):
 2. Compute advantages using GAE.
 3. Optimize the clipped PPO objective for multiple epochs.
 
+## Model Architecture
+The policy and value functions are implemented as a shared trunk with separate policy/value heads neural network, which is also common in many PPO implementations.
+
 ## Run
 ```bash
 python train.py
