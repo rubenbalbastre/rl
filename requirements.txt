@@ -1,3 +1,4 @@
+Box2D==2.3.10
 cloudpickle==3.1.2
 contourpy==1.3.3
 cuda-bindings==12.9.4
@@ -32,11 +33,14 @@ nvidia-nvshmem-cu12==3.4.5
 nvidia-nvtx-cu12==12.8.90
 packaging==26.0
 pillow==12.1.1
+pygame==2.6.1
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 setuptools==82.0.0
 six==1.17.0
+swig==4.4.1
 sympy==1.14.0
 torch==2.10.0
+tqdm==4.67.3
 triton==3.6.0
 typing_extensions==4.15.0
